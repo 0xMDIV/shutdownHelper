@@ -1,3 +1,5 @@
+#![allow(deprecated)]
+
 use chrono::{Local, NaiveTime, Datelike, Duration as ChronoDuration};
 use eframe::{egui, App};
 use serde::{Deserialize, Serialize};
