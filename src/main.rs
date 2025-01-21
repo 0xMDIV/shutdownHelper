@@ -1,50 +1,49 @@
 use chrono::{Local, NaiveTime, Datelike, Duration as ChronoDuration};
+use eframe::{egui, App};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::HashMap,
-    fs::{self, OpenOptions},
-    io::{self, BufRead, Write},
+    fs,
     process::Command,
     sync::{Arc, Mutex},
     thread,
     time::Duration,
 };
 use winapi::um::winuser::{MessageBoxA, MB_OK, MB_ICONWARNING};
+use regex::Regex;
 
-/// Struktur für die Konfiguration
-#[derive(Serialize, Deserialize, Debug)]
+
+/// Konfigurationsstruktur: enthält den Zeitplan für jeden Wochentag
+#[derive(Serialize, Deserialize, Debug, Default)]
 struct Config {
+    // Für jeden Wochentag wird ein Array gespeichert. Wir nutzen hier nur das erste Element.
     schedule: HashMap<String, Vec<String>>,
 }
 
-/// Läd die Konfiguration aus "config.json"
+/// Hilfsfunktion: Läd die Config aus config.json oder erzeugt einen Default.
 fn load_config() -> Config {
-    let data = fs::read_to_string("config.json").unwrap_or_else(|_| {
-        eprintln!("Konfigurationsdatei nicht gefunden. Erstelle Standardconfig.");
-        r#"{
-            "schedule": {
-                "Monday": [],
-                "Tuesday": [],
-                "Wednesday": [],
-                "Thursday": [],
-                "Friday": [],
-                "Saturday": [],
-                "Sunday": []
+    fs::read_to_string("config.json")
+        .ok()
+        .and_then(|data| serde_json::from_str(&data).ok())
+        .unwrap_or_else(|| {
+            let mut schedule = HashMap::new();
+            for day in &[
+                "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday",
+            ] {
+                schedule.insert(day.to_string(), vec!["".to_string()]);
             }
-        }"#
-        .to_string()
-    });
-
-    serde_json::from_str(&data).expect("Fehler beim Parsen der config.json")
+            Config { schedule }
+        })
 }
 
-/// Speichert die Konfiguration in "config.json"
+/// Hilfsfunktion: Speichert die Config in config.json.
 fn save_config(config: &Config) {
-    let json = serde_json::to_string_pretty(config).expect("Fehler beim Serialisieren");
-    fs::write("config.json", json).expect("Fehler beim Speichern der config.json");
+    if let Ok(json) = serde_json::to_string_pretty(config) {
+        let _ = fs::write("config.json", json);
+    }
 }
 
-/// Zeigt eine Windows-Benachrichtigung über die MessageBox
+/// Zeigt eine Windows-Benachrichtigung via MessageBox (winapi).
 fn show_notification(message: &str) {
     use std::ffi::CString;
     let c_message = CString::new(message).unwrap();
@@ -59,16 +58,14 @@ fn show_notification(message: &str) {
     }
 }
 
-/// Führt den Shutdown aus (Shutdown-Befehl: benötigt Administratorrechte)
+/// Führt den Shutdown aus (benötigt Administratorrechte).
 fn shutdown_pc() {
     println!("Fahre den PC herunter...");
-    let _ = Command::new("shutdown")
-        .args(&["/s", "/t", "0"])
-        .status();
+    let _ = Command::new("shutdown").args(&["/s", "/t", "0"]).status();
 }
 
-/// Berechnet die Dauer (in Sekunden) von jetzt bis zur Zielzeit im Format "HH:MM"
-/// Liegt die Zeit bereits in der Vergangenheit, wird morgen gerechnet.
+/// Berechnet die Anzahl der Sekunden von jetzt bis zur Zielzeit (Format "HH:MM").
+/// Ist die Zielzeit bereits vergangen, wird der morgige Tag angenommen.
 fn get_delay_seconds(target_time: &NaiveTime) -> i64 {
     let now = Local::now();
     let mut target = now.date().and_time(*target_time);
@@ -80,199 +77,223 @@ fn get_delay_seconds(target_time: &NaiveTime) -> i64 {
     (target.unwrap() - now).num_seconds()
 }
 
-/// Plant einen manuellen Shutdown (wird in einer Übersicht erfasst)
-fn schedule_manual_shutdown(manual_tasks: &Arc<Mutex<Vec<(String, i64)>>>) {
-    println!("Gib die gewünschte Shutdown-Zeit ein (Format HH:MM): ");
-    let mut input = String::new();
-    io::stdin().lock().read_line(&mut input).unwrap();
-    let input = input.trim();
-    match NaiveTime::parse_from_str(input, "%H:%M") {
-        Ok(target_time) => {
+/// Struktur für die GUI. Zusätzlich zur bisherigen manuellen Shutdown-Funktionalität
+/// enthält diese Version ein Bearbeitungsformular für den Zeitplan.
+struct ShutdownApp {
+    // Für manuellen Shutdown
+    manual_input: String,
+    manual_status: String,
+    // Übersicht manuell geplanter Shutdowns (für dieses Beispiel nicht weiter genutzt)
+    manual_tasks: Arc<Mutex<Vec<(String, i64)>>>,
+    // Config (Zeitplan)
+    config: Config,
+    // Status-Nachricht zum Zeitplan
+    schedule_status: String,
+    // Für jeden Wochentag: (aktiv, shutdown_time)
+    schedule_edit: HashMap<String, (bool, String)>,
+}
+
+impl Default for ShutdownApp {
+    fn default() -> Self {
+        let config = load_config();
+        let mut schedule_edit = HashMap::new();
+        // Erstelle Bearbeitungsdaten basierend auf config
+        for day in &[
+            "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday",
+        ] {
+            // Wir erwarten ein einzelnes Element im Array
+            let time_opt = config.schedule.get(*day).and_then(|v| v.get(0));
+            let active = match time_opt {
+                Some(t) if !t.trim().is_empty() => true,
+                _ => false,
+            };
+            let time_value = time_opt.cloned().unwrap_or_else(|| "".to_string());
+            schedule_edit.insert(day.to_string(), (active, time_value));
+        }
+        Self {
+            manual_input: "".to_owned(),
+            manual_status: "Kein manueller Shutdown geplant.".to_owned(),
+            manual_tasks: Arc::new(Mutex::new(Vec::new())),
+            config,
+            schedule_status: "".to_owned(),
+            schedule_edit,
+        }
+    }
+}
+
+impl ShutdownApp {
+    /// Plant einen manuellen Shutdown anhand der eingegebenen Zeit.
+    fn schedule_manual_shutdown(&mut self) {
+        if let Ok(target_time) = NaiveTime::parse_from_str(self.manual_input.trim(), "%H:%M") {
             let delay = get_delay_seconds(&target_time);
-            println!("Shutdown geplant in {} Sekunden um {}.", delay, input);
+            self.manual_status = format!("Shutdown in {} Sekunden geplant um {}.", delay, self.manual_input);
             {
-                let mut tasks = manual_tasks.lock().unwrap();
-                tasks.push((input.to_string(), delay));
+                let mut tasks = self.manual_tasks.lock().unwrap();
+                tasks.push((self.manual_input.clone(), delay));
             }
-            // Planung in einem neuen Thread
             thread::spawn(move || {
-                // Falls mehr als 5 Minuten (300 sec) bis Shutdown verbleiben, zeige die Notification 5 Minuten vorher
                 if delay > 300 {
                     thread::sleep(Duration::from_secs((delay - 300) as u64));
-                    show_notification("Der Rechner fährt in 5 Minuten herunter! Bitte speichere deine Arbeit.");
+                    show_notification("Der Rechner fährt in 5 Minuten herunter!\nBitte speichere deine Arbeit.");
                     thread::sleep(Duration::from_secs(300));
                 } else {
                     thread::sleep(Duration::from_secs(delay as u64));
                 }
                 shutdown_pc();
             });
-        }
-        Err(_) => {
-            println!("Ungültiges Format. Bitte im Format HH:MM eingeben.");
-        }
-    }
-}
-
-/// Plant wiederkehrende Shutdowns anhand der Konfiguration
-fn activate_schedules(config: &Config) {
-    // Wir starten für jeden Tag und jede Uhrzeit einen Thread
-    for (day, times) in &config.schedule {
-        for time_str in times {
-            if let Ok(target_time) = NaiveTime::parse_from_str(time_str, "%H:%M") {
-                // Finde den nächsten Wochentag, der dem Konfigurationstag entspricht
-                let now = Local::now();
-                let today = now.weekday().to_string(); // z. B. "Monday"
-                let mut days_to_wait = 0;
-                if day != &today {
-                    // Wir gehen tagweise vor, bis der gewünschte Tag erreicht ist
-                    let weekday_order = vec![
-                        "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday",
-                    ];
-                    let today_index = weekday_order.iter().position(|&d| d == today).unwrap();
-                    let target_index = weekday_order.iter().position(|&d| d == day).unwrap();
-                    if target_index >= today_index {
-                        days_to_wait = (target_index - today_index) as i64;
-                    } else {
-                        days_to_wait = (7 - today_index + target_index) as i64;
-                    }
-                }
-                // Berechne die Verzögerung (in Sekunden) bis zur Zielzeit am geplanten Tag
-                let mut delay = get_delay_seconds(&target_time) + days_to_wait * 24 * 3600;
-                // Falls die berechnete Zeit schon in der Vergangenheit liegen sollte, addiere 24h
-                if delay < 0 {
-                    delay += 24 * 3600;
-                }
-                println!(
-                    "Geplanter wiederkehrender Shutdown: {} um {} in {} Sekunden.",
-                    day, time_str, delay
-                );
-                // Starte den Thread für diesen geplanten Shutdown
-                thread::spawn(move || loop {
-                    // Warte bis zur nächsten Ausführung:
-                    if delay > 300 {
-                        thread::sleep(Duration::from_secs((delay - 300) as u64));
-                        show_notification("Der Rechner fährt in 5 Minuten herunter! Bitte speichere deine Arbeit.");
-                        thread::sleep(Duration::from_secs(300));
-                    } else {
-                        thread::sleep(Duration::from_secs(delay as u64));
-                    }
-                    shutdown_pc();
-                    // Danach plane den nächsten Shutdown in 7 Tagen (eine Woche)
-                    delay = 7 * 24 * 3600;
-                });
-            } else {
-                println!("Ungültiges Zeitformat in config für {}: {}", day, time_str);
-            }
-        }
-    }
-}
-
-/// Hilfsfunktion, um eine Zeile von der Konsole einzulesen.
-fn read_input(prompt: &str) -> String {
-    print!("{}", prompt);
-    io::stdout().flush().unwrap();
-    let mut input = String::new();
-    io::stdin().lock().read_line(&mut input).unwrap();
-    input.trim().to_string()
-}
-
-/// Bearbeitet den Zeitplan in der Konfiguration
-fn edit_schedule(config: &mut Config) {
-    println!("Bearbeite den Zeitplan:");
-    // Zeige alle Wochentage an
-    let weekdays = vec![
-        "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday",
-    ];
-    for (i, day) in weekdays.iter().enumerate() {
-        println!("{}: {} - {:?}", i + 1, day, config.schedule.get(*day).unwrap());
-    }
-    let day_choice = read_input("Welchen Tag möchtest du bearbeiten? (Zahl eingeben): ");
-    if let Ok(index) = day_choice.parse::<usize>() {
-        if index >= 1 && index <= weekdays.len() {
-            let day = weekdays[index - 1];
-            println!("Aktuelle Zeiten für {}: {:?}", day, config.schedule.get(day).unwrap());
-            println!("Optionen:");
-            println!("1 - Zeit hinzufügen");
-            println!("2 - Alle Zeiten löschen");
-            let option = read_input("Wähle eine Option (1 oder 2): ");
-            match option.as_str() {
-                "1" => {
-                    let new_time = read_input("Gib die Shutdown-Zeit ein (Format HH:MM): ");
-                    // Basis-Validierung
-                    if NaiveTime::parse_from_str(&new_time, "%H:%M").is_ok() {
-                        if let Some(times) = config.schedule.get_mut(day) {
-                            times.push(new_time);
-                        }
-                    } else {
-                        println!("Ungültiges Zeitformat.");
-                    }
-                }
-                "2" => {
-                    config.schedule.insert(day.to_string(), Vec::new());
-                }
-                _ => println!("Ungültige Option."),
-            }
-            save_config(config);
         } else {
-            println!("Ungültige Zahl.");
+            self.manual_status = "Ungültiges Zeitformat! Bitte HH:MM eingeben.".to_owned();
         }
-    } else {
-        println!("Keine gültige Zahl eingegeben.");
+    }
+
+    /// Aktiviert wiederkehrende Shutdowns anhand der Konfiguration.
+    /// In diesem Beispiel wird jeweils nur eine Zeit pro Tag verwendet.
+    fn activate_schedules(&mut self) {
+        let schedule = self.config.schedule.clone();
+        for (day, times) in schedule {
+            // Wir nutzen hier nur den ersten Eintrag
+            if let Some(time_str) = times.get(0) {
+                if !time_str.trim().is_empty() {
+                    if let Ok(target_time) = NaiveTime::parse_from_str(time_str, "%H:%M") {
+                        // Berechne, wie viele Tage bis zum gewünschten Wochentag gewartet werden müssen.
+                        let now = Local::now();
+                        let today = now.weekday().to_string(); // z. B. "Monday"
+                        let weekday_order = vec![
+                            "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday",
+                        ];
+                        let today_index = match weekday_order.iter().position(|&d| d == today) {
+                            Some(idx) => idx,
+                            None => {
+                                eprintln!("Fehler: Heute ('{}') ist nicht in weekday_order enthalten!", today);
+                                continue;
+                            }
+                        };
+                        
+                        // Position des Zieltages ermitteln
+                        let target_index = match weekday_order.iter().position(|&d| d == day) {
+                            Some(idx) => idx,
+                            None => {
+                                eprintln!("Fehler: Zieltag '{}' nicht in weekday_order enthalten!", day);
+                                continue;
+                            }
+                        };
+                        let days_to_wait = if target_index >= today_index {
+                            target_index - today_index
+                        } else {
+                            7 - today_index + target_index
+                        } as i64;
+                        let mut delay = get_delay_seconds(&target_time) + days_to_wait * 24 * 3600;
+                        if delay < 0 {
+                            delay += 24 * 3600;
+                        }
+                        println!("Geplanter Shutdown: {} um {} in {} Sekunden.", day, time_str, delay);
+                        thread::spawn(move || loop {
+                            if delay > 300 {
+                                thread::sleep(Duration::from_secs((delay - 300) as u64));
+                                show_notification("Der Rechner fährt in 5 Minuten herunter!\nBitte speichere deine Arbeit.");
+                                thread::sleep(Duration::from_secs(300));
+                            } else {
+                                thread::sleep(Duration::from_secs(delay as u64));
+                            }
+                            shutdown_pc();
+                            // Nächster Shutdown in 7 Tagen
+                            delay = 7 * 24 * 3600;
+                        });
+                    } else {
+                        println!("Ungültiges Zeitformat in config für {}: {}", day, time_str);
+                    }
+                }
+            }
+        }
+        self.schedule_status = "Wiederkehrende Shutdowns aktiviert.".to_owned();
+    }
+
+    /// Speichert die Zeitplan-Bearbeitungsdaten in die Config
+    /// und aktualisiert den wiederkehrenden Zeitplan.
+    fn save_schedule(&mut self) {
+        // Erstelle einen Regex, der das Format HH:MM validiert.
+        // ^\d{2}:\d{2}$ bedeutet: genau 2 Ziffern, ein Doppelpunkt, genau 2 Ziffern.
+        let time_regex = Regex::new(r"^\d{2}:\d{2}$").unwrap();
+
+        for (day, (active, time)) in &self.schedule_edit {
+            if *active {
+                if time_regex.is_match(time.trim()) {
+                    self.config.schedule.insert(day.clone(), vec![time.trim().to_string()]);
+                } else {
+                    // Falls das Format ungültig ist, kannst du auch standardmäßig einen leeren Wert
+                    // einsetzen oder eine Fehlermeldung setzen.
+                    println!("Ungültiges Zeitformat für {}: {}. Bitte gib HH:MM ein.", day, time);
+                    self.config.schedule.insert(day.clone(), vec!["".to_string()]);
+                }
+            } else {
+                self.config.schedule.insert(day.clone(), vec!["".to_string()]);
+            }
+        }
+        save_config(&self.config);
+        self.activate_schedules();
+        self.schedule_status = "Zeitplan gespeichert und aktiviert.".to_string();
     }
 }
 
-/// Zeigt eine Übersicht an: Wiederkehrende Shutdowns (aus config) und manuelle Shutdowns
-fn show_overview(config: &Config, manual_tasks: &Arc<Mutex<Vec<(String, i64)>>>) {
-    println!("\n=== Übersicht ===");
-    println!("Wiederkehrende Shutdown-Zeiten (config):");
-    for (day, times) in &config.schedule {
-        println!("  {}: {}", day, if times.is_empty() { "Keine".to_string() } else { times.join(", ") });
+impl App for ShutdownApp {
+    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        egui::CentralPanel::default().show(ctx, |ui| {
+            ui.heading("Shutdown GUI App");
+            ui.separator();
 
+            // Manueller Shutdown
+            ui.label("Manueller Shutdown (Format HH:MM):");
+            ui.text_edit_singleline(&mut self.manual_input);
+            if ui.button("Shutdown manuell planen").clicked() {
+                self.schedule_manual_shutdown();
+            }
+            ui.label(&self.manual_status);
+
+            ui.separator();
+            // Übersicht des Wiederkehrenden Zeitplans (aus config.json)
+            ui.heading("Wiederkehrender Zeitplan");
+            for (day, times) in &self.config.schedule {
+                ui.horizontal(|ui| {
+                    ui.label(format!("{}:", day));
+                    if times.is_empty() || times[0].trim().is_empty() {
+                        ui.label("Nicht aktiviert".to_string());
+                    } else {
+                        ui.label(times.join(", "));
+                    }
+                });
+            }
+            if ui.button("Zeitplan neu laden und aktivieren").clicked() {
+                self.config = load_config();
+                self.activate_schedules();
+            }
+            ui.label(&self.schedule_status);
+
+            ui.separator();
+            // Bearbeiten des Zeitplans – für jeden Wochentag
+            ui.heading("Zeitplan bearbeiten");
+            for day in &["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"] {
+                if let Some((active, time)) = self.schedule_edit.get_mut(&day.to_string()) {
+                    ui.horizontal(|ui| {
+                        ui.label(format!("{}:", day));
+                        ui.checkbox(active, "");
+                        ui.label("Uhrzeit (HH:MM):");
+                        ui.text_edit_singleline(time);
+                    });
+                }
+            }
+            if ui.button("Zeitplan speichern").clicked() {
+                self.save_schedule();
+            }
+        });
     }
-    println!("\nManuell geplante Shutdowns:");
-    let tasks = manual_tasks.lock().unwrap();
-    if tasks.is_empty() {
-        println!("  Keine manuellen Shutdowns geplant.");
-    } else {
-        for (time_str, seconds) in tasks.iter() {
-            println!("  {} (in {} Sekunden)", time_str, seconds);
-        }
-    }
-    println!("====================\n");
 }
 
 fn main() {
-    let manual_tasks: Arc<Mutex<Vec<(String, i64)>>> = Arc::new(Mutex::new(Vec::new()));
-    let mut config = load_config();
-
-    // Aktiviere die wiederkehrenden Shutdowns aus der Konfiguration
-    activate_schedules(&config);
-
-    loop {
-        println!("\n--- Menü ---");
-        println!("1 - Manueller Shutdown");
-        println!("2 - Zeitplan anzeigen und reaktivieren");
-        println!("3 - Zeitplan bearbeiten");
-        println!("4 - Beenden");
-        show_overview(&config, &manual_tasks);
-        let choice = read_input("Wähle eine Option (1-4): ");
-        match choice.as_str() {
-            "1" => {
-                schedule_manual_shutdown(&manual_tasks);
-            }
-            "2" => {
-                // Läd die Config erneut und aktiviert Zeitpläne
-                config = load_config();
-                activate_schedules(&config);
-            }
-            "3" => {
-                edit_schedule(&mut config);
-            }
-            "4" => {
-                println!("Programm wird beendet.");
-                std::process::exit(0);
-            }
-            _ => println!("Ungültige Option."),
-        }
-    }
+    let app = ShutdownApp::default();
+    let native_options = eframe::NativeOptions::default();
+    eframe::run_native(
+        "Shutdown GUI App",
+        native_options,
+        Box::new(|_cc| Box::new(app)),
+    );
 }

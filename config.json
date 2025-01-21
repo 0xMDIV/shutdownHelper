@@ -1,13 +1,25 @@
 {
   "schedule": {
-    "Thursday": [],
-    "Sunday": [],
-    "Monday": [
-      "00:00"
+    "Friday": [
+      ""
     ],
-    "Friday": [],
-    "Tuesday": [],
-    "Wednesday": [],
-    "Saturday": []
+    "Thursday": [
+      ""
+    ],
+    "Saturday": [
+      ""
+    ],
+    "Wednesday": [
+      "19:00"
+    ],
+    "Sunday": [
+      ""
+    ],
+    "Monday": [
+      "12:00"
+    ],
+    "Tuesday": [
+      ""
+    ]
   }
 }
