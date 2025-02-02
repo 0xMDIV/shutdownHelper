@@ -1,4 +1,5 @@
 #![allow(deprecated)]
+#![windows_subsystem = "windows"]
 
 use chrono::{Local, NaiveTime, Datelike, Duration as ChronoDuration};
 use eframe::{egui, App};
@@ -99,27 +100,22 @@ impl Default for ShutdownApp {
     fn default() -> Self {
         let config = load_config();
         let mut schedule_edit = HashMap::new();
-        // Erstelle Bearbeitungsdaten basierend auf config
-        for day in &[
-            "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday",
-        ] {
-            // Wir erwarten ein einzelnes Element im Array
+        for day in &["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"] {
             let time_opt = config.schedule.get(*day).and_then(|v| v.get(0));
-            let active = match time_opt {
-                Some(t) if !t.trim().is_empty() => true,
-                _ => false,
-            };
+            let active = time_opt.map_or(false, |t| !t.trim().is_empty());
             let time_value = time_opt.cloned().unwrap_or_else(|| "".to_string());
             schedule_edit.insert(day.to_string(), (active, time_value));
         }
-        Self {
+        let mut app = Self {
             manual_input: "".to_owned(),
             manual_status: "Kein manueller Shutdown geplant.".to_owned(),
             manual_tasks: Arc::new(Mutex::new(Vec::new())),
             config,
             schedule_status: "".to_owned(),
             schedule_edit,
-        }
+        };
+        app.activate_schedules();
+        app
     }
 }
 
@@ -254,15 +250,21 @@ impl App for ShutdownApp {
             ui.separator();
             // Übersicht des Wiederkehrenden Zeitplans (aus config.json)
             ui.heading("Wiederkehrender Zeitplan");
-            for (day, times) in &self.config.schedule {
-                ui.horizontal(|ui| {
-                    ui.label(format!("{}:", day));
-                    if times.is_empty() || times[0].trim().is_empty() {
-                        ui.label("Nicht aktiviert".to_string());
-                    } else {
-                        ui.label(times.join(", "));
-                    }
-                });
+            let weekday_order = vec![
+                "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday",
+            ];
+
+            for day in weekday_order {
+                if let Some(times) = self.config.schedule.get(day) {
+                    ui.horizontal(|ui| {
+                        ui.label(format!("{}:", day));
+                        if times.is_empty() || times[0].trim().is_empty() {
+                            ui.label("Nicht aktiviert".to_string());
+                        } else {
+                            ui.label(times.join(", "));
+                        }
+                    });
+                }
             }
             if ui.button("Zeitplan neu laden und aktivieren").clicked() {
                 self.config = load_config();
